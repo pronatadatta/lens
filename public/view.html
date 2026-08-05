@@ -448,8 +448,13 @@
     switch (action) {
       case "LEFT":     handled = zoomed ? panBy(-1, 0) : changePage(-1); break;
       case "RIGHT":    handled = zoomed ? panBy(+1, 0) : changePage(+1); break;
-      case "UP":       handled = zoomed ? panBy(0, -1) : false;          break;
-      case "DOWN":     handled = zoomed ? panBy(0, +1) : false;          break;
+      // In BROWSE the vertical axis is a second way to page, so a
+      // swipe pages without having to find the horizontal axis first.
+      // Down advances and up goes back, matching right/left. To invert,
+      // swap the two changePage signs below — nothing else reads this
+      // convention. In ZOOMED the axis still pans, unchanged.
+      case "UP":       handled = zoomed ? panBy(0, -1) : changePage(-1); break;
+      case "DOWN":     handled = zoomed ? panBy(0, +1) : changePage(+1); break;
       case "SELECT":   handled = advanceZoom();     break;
       case "CONTRAST": handled = toggleContrast();  break;
       case "RESET":    handled = resetViewportAction(); break;
