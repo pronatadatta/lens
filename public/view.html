@@ -167,6 +167,49 @@
   #zoomflash.show  { opacity: 1; }
   #zoomflash.limit { color: #ffcf8a; }   /* amber: end of the ladder */
 
+  /* ==========================================================
+     MENU
+     ----------------------------------------------------------
+     The scrim is near-opaque black on purpose. An unlit pixel on
+     the waveguide is transparent, so painting black over the photo
+     both hides it and turns those pixels off — the legible option
+     here is also the low-power one.
+     ========================================================== */
+  #menu {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.9);
+    font: 500 23px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.03em;
+  }
+  #menu.open { display: flex; }
+
+  #menu .title {
+    font-size: 13px;
+    letter-spacing: 0.22em;
+    color: #6b6b73;
+    margin-bottom: 20px;
+  }
+
+  /* Unselected rows sit dim so the highlighted one is unmistakable
+     at a glance — there is no cursor to look for. */
+  #menu .row {
+    padding: 11px 18px;
+    color: #7c7c86;
+    white-space: nowrap;
+  }
+  #menu .row.sel {
+    color: #fff;
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.25);
+  }
+  /* Destructive rows only turn red once highlighted: red-by-default
+     would draw the eye straight to the one row that cannot be undone. */
+  #menu .row.danger.sel { color: #ff6b6b; }
+
   /* Only with ?debug=1 — prints raw key names so the wearer can find
      out what a given gesture actually emits on real hardware. */
   #debug {
@@ -214,6 +257,7 @@
     <!-- Outside #hud: zoom feedback must not inherit the HUD's idle
          fade, and must show even after the arrows have gone. -->
     <div id="zoomflash"></div>
+    <div id="menu" aria-hidden="true"></div>
     <div id="debug"></div>
   </div>
 
@@ -268,6 +312,18 @@
   // ?debug=1 prints every key the page receives, bound or not.
   const DEBUG = /[?&]debug=1(&|$)/.test(window.location.search);
 
+  // Days a photo sits in the bin before it is purged for good.
+  const BIN_RETENTION_DAYS = 7;
+
+  // The band emits keydown only — never keyup — so a press has no
+  // measurable duration and a long press is undetectable. The menu is
+  // opened by a double pinch instead. The lower bound sits above
+  // INPUT_DEBOUNCE_MS so hardware bounce cannot open the menu; the
+  // upper bound stays short enough that two deliberate zooms are not
+  // swallowed as one gesture.
+  const DOUBLE_PINCH_MIN_MS = 170;
+  const DOUBLE_PINCH_MAX_MS = 500;
+
   // Contrast boost for the waveguide, which washes out midtones in
   // ambient light. 1.35 visibly separates midtones while staying
   // under the ~1.5 point where speculars clip to flat white; the
@@ -291,6 +347,19 @@
   let appState = APP.LOADING;
   let photos   = [];
   let errorText = "";
+
+  // Which gallery is on screen. The bin is the same viewer over a
+  // different query — same paging, zoom, pan and HUD.
+  let collection = "live";          // "live" | "bin"
+
+  // False once a query proves the deleted_at column is missing, i.e.
+  // the migration has not been run. Everything bin-related then hides
+  // itself and the viewer behaves exactly as it did before.
+  let binSupported = true;
+
+  let menuOpen  = false;
+  let menuIndex = 0;
+  let menuRows  = [];
 
   // READY-only viewport state.
   let pageIndex  = 0;
@@ -329,6 +398,7 @@
   };
 
   const flashEl = document.getElementById("zoomflash");
+  const menuEl  = document.getElementById("menu");
   const debugEl = document.getElementById("debug");
 
   let hudTimer   = null;
@@ -375,22 +445,78 @@
     return getClient().storage.from(BUCKET).getPublicUrl(photo.storage_path).data.publicUrl;
   }
 
+  // A pre-migration database has no deleted_at column. Rather than
+  // fail, the viewer detects that once and falls back to its previous
+  // unfiltered behaviour, so this can be deployed before the SQL is
+  // run without the glasses showing an error.
+  function isMissingDeletedAt(error) {
+    const blob = ((error && error.message) || "") + " " +
+                 ((error && error.code) || "") + " " +
+                 ((error && error.details) || "");
+    const s = blob.toLowerCase();
+    return s.indexOf("deleted_at") !== -1 || s.indexOf("42703") !== -1;
+  }
+
+  async function fetchCollection() {
+    const c = getClient();
+
+    // "order" is a reserved SQL word: quoted in the column list and in
+    // .order() because both are identifier positions. deleted_at is an
+    // ordinary identifier and needs no quoting.
+    if (binSupported) {
+      let q = c.from("photos")
+               .select('id, storage_path, "order", display_name, deleted_at');
+      q = (collection === "bin") ? q.not("deleted_at", "is", null)
+                                 : q.is("deleted_at", null);
+      const { data, error } = await q.order('"order"', { ascending: true });
+      if (!error) return Array.isArray(data) ? data : [];
+      if (!isMissingDeletedAt(error)) {
+        throw new Error(error.message || "Supabase returned an error.");
+      }
+      binSupported = false;         // migration not run yet
+      collection = "live";
+    }
+
+    const { data, error } = await c.from("photos")
+      .select('id, storage_path, "order", display_name')
+      .order('"order"', { ascending: true });
+    if (error) throw new Error(error.message || "Supabase returned an error.");
+    return Array.isArray(data) ? data : [];
+  }
+
+  // Housekeeping, not a feature: sweeps anything that has sat in the
+  // bin past its retention window. Runs lazily on load rather than on
+  // a schedule — no cron, no server, and for a personal gallery
+  // "whenever you open it" is often enough. Deliberately fire and
+  // forget: the gallery must never wait on it, and a failure here
+  // must never surface as a gallery error.
+  async function purgeExpired() {
+    try {
+      const c = getClient();
+      const cutoff = new Date(Date.now() - BIN_RETENTION_DAYS * 86400000).toISOString();
+      const { data, error } = await c.from("photos")
+        .select("id, storage_path")
+        .not("deleted_at", "is", null)
+        .lt("deleted_at", cutoff);
+      if (error || !data || data.length === 0) return;
+
+      // Storage object first: a removed row would orphan the file with
+      // nothing left pointing at it.
+      await c.storage.from(BUCKET).remove(data.map(function (p) { return p.storage_path; }));
+      await c.from("photos").delete().in("id", data.map(function (p) { return p.id; }));
+    } catch (ignored) { /* housekeeping never blocks the viewer */ }
+  }
+
   async function loadGallery() {
     appState = APP.LOADING;
     errorText = "";
+    closeMenuSilently();
     render();
 
     try {
-      // "order" is a reserved SQL word: quoted in the column list and
-      // in .order() because both are identifier positions.
-      const { data, error } = await getClient()
-        .from("photos")
-        .select('id, storage_path, "order", display_name')
-        .order('"order"', { ascending: true });
+      photos = await fetchCollection();
 
-      if (error) throw new Error(error.message || "Supabase returned an error.");
-
-      photos = Array.isArray(data) ? data : [];
+      if (binSupported && collection === "live") purgeExpired();
 
       if (photos.length === 0) {
         clearPrefetch();
@@ -629,6 +755,148 @@
   }
 
   /* ============================================================
+     MENU
+     ============================================================ */
+
+  function buildMenuRows() {
+    const rows = [];
+    if (collection === "live") {
+      // Both entries depend on the migration; without it the menu is
+      // just Cancel, which is honest rather than offering a dead action.
+      if (binSupported) {
+        rows.push({ label: "Delete photo",   danger: true,  run: sendToBin });
+        rows.push({ label: "Recycle bin",    run: openBin });
+      }
+    } else {
+      rows.push({ label: "Restore photo",    run: restorePhoto });
+      rows.push({ label: "Delete forever",   danger: true,  run: deleteForever });
+      rows.push({ label: "Back to photos",   run: backToLive });
+    }
+    rows.push({ label: "Cancel", run: closeMenu });
+    return rows;
+  }
+
+  function openMenu() {
+    menuRows = buildMenuRows();
+    // Cancel is last and starts selected: on a display where you cannot
+    // see precisely what is highlighted, a stray extra pinch should do
+    // nothing rather than delete a photo.
+    menuIndex = menuRows.length - 1;
+    menuOpen = true;
+    hudEl.classList.remove("show");
+    if (hudTimer) { clearTimeout(hudTimer); hudTimer = null; }
+    render();
+    return true;
+  }
+
+  function closeMenuSilently() {
+    menuOpen = false;
+    menuEl.classList.remove("open");
+  }
+
+  function closeMenu() {
+    closeMenuSilently();
+    render();
+    bumpHud();
+    return true;
+  }
+
+  function moveMenu(delta) {
+    if (menuRows.length === 0) return false;
+    menuIndex = (menuIndex + delta + menuRows.length) % menuRows.length;
+    renderMenu();
+    return true;
+  }
+
+  function renderMenu() {
+    if (!menuOpen) { menuEl.classList.remove("open"); return; }
+    let html = '<div class="title">' +
+               (collection === "bin" ? "RECYCLE BIN" : "PHOTO") + "</div>";
+    for (let i = 0; i < menuRows.length; i++) {
+      const row = menuRows[i];
+      html += '<div class="row' +
+              (i === menuIndex ? " sel" : "") +
+              (row.danger ? " danger" : "") + '">' +
+              escapeText(row.label) + "</div>";
+    }
+    menuEl.innerHTML = html;
+    menuEl.classList.add("open");
+  }
+
+  function escapeText(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  /* ---------- menu actions ---------- */
+
+  // Drops the photo currently on screen out of the loaded gallery and
+  // settles the viewer on a sensible neighbour, without a refetch.
+  function dropCurrentFromView() {
+    photos.splice(pageIndex, 1);
+    clearPrefetch();
+    if (photos.length === 0) {
+      appState = APP.EMPTY;
+      render();
+      return;
+    }
+    if (pageIndex > photos.length - 1) pageIndex = photos.length - 1;
+    resetViewport();
+    showCurrentPage();
+    bumpHud();
+  }
+
+  async function withCurrentPhoto(busyText, work) {
+    const photo = photos[pageIndex];
+    if (!photo) return closeMenu();
+    closeMenuSilently();
+    showOverlay(busyText, false);
+    photoEl.style.display = "none";
+    try {
+      await work(photo, getClient());
+      dropCurrentFromView();
+    } catch (err) {
+      errorText = (err && err.message) ? err.message : String(err);
+      appState = APP.ERROR;
+      render();
+    }
+    return true;
+  }
+
+  function sendToBin() {
+    return withCurrentPhoto("Moving to bin…", async function (photo, c) {
+      const { error } = await c.from("photos")
+        .update({ deleted_at: new Date().toISOString() })
+        .eq("id", photo.id);
+      if (error) throw new Error(error.message);
+    });
+  }
+
+  function restorePhoto() {
+    return withCurrentPhoto("Restoring…", async function (photo, c) {
+      const { error } = await c.from("photos")
+        .update({ deleted_at: null })
+        .eq("id", photo.id);
+      if (error) throw new Error(error.message);
+    });
+  }
+
+  function deleteForever() {
+    return withCurrentPhoto("Deleting…", async function (photo, c) {
+      // Storage object first, then the row: the reverse order would
+      // orphan the file with nothing left pointing at it.
+      const rm = await c.storage.from(BUCKET).remove([photo.storage_path]);
+      if (rm.error) throw new Error(rm.error.message);
+      const { error } = await c.from("photos").delete().eq("id", photo.id);
+      if (error) throw new Error(error.message);
+    });
+  }
+
+  function openBin()    { collection = "bin";  loadGallery(); return true; }
+  function backToLive() { collection = "live"; loadGallery(); return true; }
+
+  /* ============================================================
      INPUT
      ============================================================ */
 
@@ -671,9 +939,33 @@
       return true;
     }
 
-    // LOADING and EMPTY swallow everything. EMPTY is genuinely
-    // terminal — there is no gallery to retry into.
+    // An empty BIN still needs a way out, or the wearer is stranded in
+    // a gallery with nothing in it. An empty live gallery stays
+    // terminal: there is nothing to retry into.
+    if (appState === APP.EMPTY) {
+      if (collection === "bin" && action === "SELECT") {
+        lastActionAt = now;
+        backToLive();
+        return true;
+      }
+      return false;
+    }
+
     if (appState !== APP.READY) return false;
+
+    // The menu owns input while it is open: arrows move the highlight
+    // and never page or pan underneath it.
+    if (menuOpen) {
+      let ok = false;
+      if (action === "UP")        ok = moveMenu(-1);
+      else if (action === "DOWN") ok = moveMenu(+1);
+      else if (action === "SELECT") {
+        const row = menuRows[menuIndex];
+        ok = row ? (row.run() !== false) : false;
+      }
+      if (ok) lastActionAt = now;
+      return ok;
+    }
 
     const zoomed = mode() === "ZOOMED";
     let handled = false;
@@ -712,32 +1004,36 @@
     return handled;
   }
 
-  // ?debug=1 only. Establishes whether the band reports a pinch as a
-  // keydown/keyup PAIR — if it does, hold duration is measurable in JS
-  // and a long-press menu is possible without any new gesture. If only
-  // down-arrows ever appear in the log, keyup never fires and a hold is
-  // indistinguishable from a tap, which settles the question the other
-  // way. Repeats are counted rather than logged so they cannot flood
-  // the readout.
-  const HOLD_PROBE_MS = 500;
-  const keyHeldSince = Object.create(null);
-  const keyRepeats   = Object.create(null);
+  // Snapshot of the viewport taken before a pinch acts on it, so the
+  // zoom can be handed back if that pinch turns out to be the first
+  // half of a double. The alternative — delaying every pinch to see
+  // whether a second follows — would put the double-pinch window's
+  // worth of lag on every single zoom.
+  let lastPinchAt = 0;
+  let preZoom = null;
+
+  function undoPendingZoom() {
+    if (!preZoom) return;
+    zoomScale = preZoom.zoomScale;
+    zoomDir   = preZoom.zoomDir;
+    panX      = preZoom.panX;
+    panY      = preZoom.panY;
+    preZoom = null;
+    clampPan();
+    applyTransform();
+    // Kill the "+ 1.5×" the first pinch flashed: it describes a zoom
+    // that no longer happened.
+    flashEl.classList.remove("show");
+    if (flashTimer) { clearTimeout(flashTimer); flashTimer = null; }
+    render();
+  }
 
   window.addEventListener("keydown", function (e) {
-    const name = (e.key === " ") ? "Space" : e.key;
-
-    // The press timestamp must be recorded unconditionally: the keyup
-    // handler measures against it, and on-device DEBUG is always off,
-    // so gating this would make every hold measure as zero and HOLD
-    // could never fire. Only the on-screen logging is DEBUG-gated.
-    if (e.repeat) {
-      keyRepeats[name] = (keyRepeats[name] || 0) + 1;
-    } else {
-      keyHeldSince[name] = Date.now();
-      keyRepeats[name] = 0;
-      // Logged before the bound/unbound test on purpose: the point is
-      // to reveal keys we do NOT already handle.
-      debugNote("↓ " + name + " [" + (e.code || "?") + "] " +
+    if (!e.repeat) {
+      // Logged before the bound/unbound test on purpose: the point of
+      // ?debug=1 is to reveal keys we do NOT already handle.
+      debugNote((e.key === " " ? "Space" : e.key) +
+                " [" + (e.code || "?") + "] " +
                 (KEY_ACTIONS[e.key] ? "→ " + KEY_ACTIONS[e.key] : "unbound"));
     }
 
@@ -745,50 +1041,25 @@
     const action = KEY_ACTIONS[e.key];
     if (!action) return;
     e.preventDefault();
+
+    // Intercepted ahead of dispatch so the second pinch never reaches
+    // the zoom ladder — dispatch's 150ms debounce would let it through
+    // as another zoom step.
+    if (action === "SELECT" && !menuOpen && appState === APP.READY) {
+      const now = Date.now();
+      const gap = now - lastPinchAt;
+      if (gap >= DOUBLE_PINCH_MIN_MS && gap <= DOUBLE_PINCH_MAX_MS) {
+        lastPinchAt = 0;
+        undoPendingZoom();      // give back the zoom the first pinch took
+        openMenu();
+        return;
+      }
+      lastPinchAt = now;
+      preZoom = { zoomScale: zoomScale, zoomDir: zoomDir, panX: panX, panY: panY };
+    }
+
     dispatch(action);
   });
-
-  // Deliberately NOT gated on DEBUG. Only the registered Web App URL
-  // receives the D-pad — a probe at any other path renders but gets no
-  // key events, and ?debug=1 does not survive the trip to the glasses.
-  // So the instrument has to ride along in the shipped page. It reads
-  // nothing and changes no state: it can only flash text.
-  //
-  // Two one-shot announcements, because "no HOLD appeared" is ambiguous
-  // on its own — it looks identical whether holds are unsupported or
-  // the listener never ran. The first keyup ever seen proves the
-  // instrument is live, so a silent HOLD afterwards is a real answer.
-  let announcedKeyup = false;
-
-  window.addEventListener("keyup", function (e) {
-    const name = (e.key === " ") ? "Space" : e.key;
-    const started = keyHeldSince[name];
-    const held = started ? (Date.now() - started) : -1;
-    const rpt = keyRepeats[name] || 0;
-    delete keyHeldSince[name];
-    keyRepeats[name] = 0;
-
-    debugNote("↑ " + name + "  " + (held < 0 ? "?" : held + "ms") +
-              (rpt ? "  rpt" + rpt : "") +
-              (held >= HOLD_PROBE_MS ? "  ← HOLD" : ""));
-
-    if (held >= HOLD_PROBE_MS)      flashProbe("HOLD " + held + "ms");
-    else if (!announcedKeyup)       flashProbe("KEYUP ✓ " + Math.max(held, 0) + "ms");
-    announcedKeyup = true;
-  });
-
-  // Borrows the zoom flash element rather than adding chrome: this is
-  // temporary instrumentation and should leave no trace once removed.
-  function flashProbe(text) {
-    flashEl.classList.remove("limit");
-    flashEl.textContent = text;
-    flashEl.classList.add("show");
-    if (flashTimer) clearTimeout(flashTimer);
-    flashTimer = setTimeout(function () {
-      flashEl.classList.remove("show");
-      flashTimer = null;
-    }, 1600);
-  }
 
   /* ============================================================
      HOST INTERFACE
@@ -872,6 +1143,12 @@
   }
 
   function updateHud() {
+    // The menu owns the screen while open — arrows there move the
+    // highlight, so paging affordances would be actively misleading.
+    if (menuOpen) {
+      hudEl.classList.remove("show");
+      return;
+    }
     if (appState !== APP.READY) {
       hudEl.classList.remove("show");
       if (hudTimer) { clearTimeout(hudTimer); hudTimer = null; }
@@ -886,9 +1163,13 @@
       arrowEls[d].classList.toggle("on", !!dirs[d]);
     });
 
-    // A single-photo gallery has nothing to count.
-    counterEl.textContent =
-      photos.length > 1 ? (pageIndex + 1) + " / " + photos.length : "";
+    // A single-photo gallery has nothing to count — but the bin always
+    // labels itself, so the wearer can never mistake it for the real
+    // gallery and think their photos have vanished.
+    const count = (pageIndex + 1) + " / " + photos.length;
+    counterEl.textContent = (collection === "bin")
+      ? ("BIN " + count)
+      : (photos.length > 1 ? count : "");
     zoomEl.textContent = zoomed ? formatZoom(zoomScale) : "";
   }
 
@@ -938,7 +1219,9 @@
 
       case APP.EMPTY:
         photoEl.style.display = "none";
-        showOverlay("No photos yet", false);
+        showOverlay(collection === "bin"
+          ? "Recycle bin is empty\n\nPinch to go back"
+          : "No photos yet", false);
         break;
 
       case APP.READY:
@@ -949,6 +1232,7 @@
     // Keeps the arrow set truthful on every state change without
     // forcing it visible; bumpHud owns visibility.
     updateHud();
+    renderMenu();
   }
 
   render();

@@ -26,6 +26,25 @@ create index if not exists photos_order_idx
     on public.photos ("order" asc, created_at asc);
 
 -- ------------------------------------------------------------
+-- 1b. RECYCLE BIN
+-- ------------------------------------------------------------
+-- Soft delete. NULL means the photo is live; a timestamp means it
+-- sits in the bin and becomes eligible for permanent deletion
+-- seven days later.
+--
+-- A timestamp rather than a boolean deliberately: the value IS the
+-- expiry clock, so no second column is needed to know when a photo
+-- ages out.
+
+alter table public.photos
+    add column if not exists deleted_at timestamptz;
+
+-- Both galleries filter on this column, and the purge sweep orders
+-- by it, so it is worth indexing on its own.
+create index if not exists photos_deleted_at_idx
+    on public.photos (deleted_at);
+
+-- ------------------------------------------------------------
 -- 2. ROW-LEVEL SECURITY: photos table
 -- ------------------------------------------------------------
 -- Design decision: this is a personal, unauthenticated app.

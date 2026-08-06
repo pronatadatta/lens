@@ -252,6 +252,7 @@
 
   var photos = []; // local cache, kept in sync with the DB
   var toastTimer = null;
+  var binSupported = true;   // cleared if the deleted_at migration is absent
 
   // ---------- helpers ----------
 
@@ -286,15 +287,34 @@
 
   // ---------- data ----------
 
+  // A pre-migration database has no deleted_at column. Detect that once
+  // and fall back to the unfiltered query, so this page keeps working
+  // whether or not the recycle-bin migration has been run yet.
+  function isMissingDeletedAt(error) {
+    const blob = ((error && error.message) || "") + " " +
+                 ((error && error.code) || "") + " " +
+                 ((error && error.details) || "");
+    const s = blob.toLowerCase();
+    return s.indexOf("deleted_at") !== -1 || s.indexOf("42703") !== -1;
+  }
+
   function loadPhotos() {
     // "order" is a reserved SQL word — quoted in the schema, so it must be
     // quoted here too, both in the select column list and in .order().
-    return sb
-      .from("photos")
-      .select(SELECT_COLUMNS)
+    // Binned photos are excluded: one deleted on the glasses must not
+    // keep showing up here, or the two views disagree about what exists.
+    var query = binSupported
+      ? sb.from("photos").select(SELECT_COLUMNS).is("deleted_at", null)
+      : sb.from("photos").select(SELECT_COLUMNS);
+
+    return query
       .order('"order"', { ascending: true })
       .then(function (res) {
         if (res.error) {
+          if (binSupported && isMissingDeletedAt(res.error)) {
+            binSupported = false;
+            return loadPhotos();
+          }
           toast("Failed to load photos: " + res.error.message);
           return;
         }
@@ -359,29 +379,47 @@
 
   // ---------- delete ----------
 
+  // Soft delete when the migration is present, so this button and the
+  // glasses agree on what "delete" means: the photo goes to the bin and
+  // stays recoverable for 7 days. Without the migration there is no bin
+  // to go to, so it falls back to the old permanent delete — and says so.
   function deletePhoto(photo) {
     var label = photo.display_name || photo.storage_path;
-    if (!window.confirm('Delete "' + label + '"? This can\'t be undone.')) {
-      return Promise.resolve();
+
+    if (!binSupported) {
+      if (!window.confirm('Delete "' + label + '" permanently? This can\'t be undone.')) {
+        return Promise.resolve();
+      }
+      toast("Deleting…");
+      return sb.storage.from(BUCKET).remove([photo.storage_path]).then(function (storageRes) {
+        if (storageRes.error) throw new Error("Storage: " + storageRes.error.message);
+        return sb.from("photos").delete().eq("id", photo.id);
+      }).then(function (dbRes) {
+        if (dbRes.error) throw new Error("Database: " + dbRes.error.message);
+        photos = photos.filter(function (p) { return p.id !== photo.id; });
+        render();
+        toast("Deleted");
+      }).catch(function (err) {
+        toast("Delete failed: " + err.message);
+      });
     }
 
-    toast("Deleting…");
+    if (!window.confirm('Move "' + label + '" to the recycle bin?')) {
+      return Promise.resolve();
+    }
+    toast("Moving to bin…");
 
-    return sb.storage.from(BUCKET).remove([photo.storage_path]).then(function (storageRes) {
-      if (storageRes.error) {
-        throw new Error("Storage: " + storageRes.error.message);
-      }
-      return sb.from("photos").delete().eq("id", photo.id);
-    }).then(function (dbRes) {
-      if (dbRes.error) {
-        throw new Error("Database: " + dbRes.error.message);
-      }
-      photos = photos.filter(function (p) { return p.id !== photo.id; });
-      render();
-      toast("Deleted");
-    }).catch(function (err) {
-      toast("Delete failed: " + err.message);
-    });
+    return sb.from("photos")
+      .update({ deleted_at: new Date().toISOString() })
+      .eq("id", photo.id)
+      .then(function (res) {
+        if (res.error) throw new Error(res.error.message);
+        photos = photos.filter(function (p) { return p.id !== photo.id; });
+        render();
+        toast("Moved to bin");
+      }).catch(function (err) {
+        toast("Delete failed: " + err.message);
+      });
   }
 
   // ---------- upload ----------
