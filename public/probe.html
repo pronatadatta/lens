@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Lens · Input Probe</title>
+
+<!-- ==========================================================
+     Standalone input probe.
+     ----------------------------------------------------------
+     Deliberately has NO dependencies: no config.js, no Supabase,
+     no query string to lose in transit. If this page renders at
+     all, the probe is running — which removes every way the last
+     attempt could fail silently and leave the result ambiguous.
+
+     It answers one question: does releasing a pinch fire keyup,
+     so that hold duration is measurable in JavaScript?
+     ========================================================== -->
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none; cursor: none;
+  }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #stage {
+    position: relative; width: 600px; height: 600px; flex: none;
+    padding: 16px; box-sizing: border-box;
+    display: flex; flex-direction: column;
+  }
+
+  h1 {
+    margin: 0; font-size: 17px; font-weight: 600;
+    color: #fff; letter-spacing: .06em;
+  }
+  .hint { margin: 4px 0 0; font-size: 15px; color: #8a8a92; }
+
+  /* The verdict is the whole point of the page, so it gets the
+     centre of the display and the largest type. */
+  #verdict {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+  }
+  #big {
+    font-size: 40px; font-weight: 700; line-height: 1.15;
+    color: #ff8f6b;                       /* amber until proven otherwise */
+    letter-spacing: .02em;
+  }
+  #big.yes { color: #6ee787; }            /* green only once keyup is real */
+  #sub { margin-top: 10px; font-size: 17px; color: #b9b9c2; }
+
+  #log {
+    font-size: 15px; line-height: 1.5; color: #6ee787;
+    white-space: pre; height: 170px; overflow: hidden;
+  }
+  #log .none { color: #6b6b73; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <h1>INPUT PROBE</h1>
+    <p class="hint">Pinch &amp; hold ~1s. Then swipe any direction.</p>
+
+    <div id="verdict">
+      <div id="big">WAITING</div>
+      <div id="sub">no input received yet</div>
+    </div>
+
+    <div id="log"><span class="none">key events appear here…</span></div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  var HOLD_MS = 500;                 // anything longer counts as a hold
+
+  var bigEl = document.getElementById("big");
+  var subEl = document.getElementById("sub");
+  var logEl = document.getElementById("log");
+
+  var lines      = [];
+  var downAt     = Object.create(null);
+  var repeats    = Object.create(null);
+  var sawKeyDown = false;
+  var sawKeyUp   = false;             // THE answer
+  var maxHold    = 0;
+  var total      = 0;
+
+  function paint() {
+    if (!sawKeyDown) {
+      bigEl.className = "";
+      bigEl.textContent = "WAITING";
+      subEl.textContent = "no input received yet";
+      return;
+    }
+    if (!sawKeyUp) {
+      // Keys arrive but releases do not: a hold cannot be timed, so a
+      // long-press menu is impossible no matter how it is coded.
+      bigEl.className = "";
+      bigEl.textContent = "NO KEYUP";
+      subEl.textContent = "hold is NOT measurable · " + total + " events";
+      return;
+    }
+    bigEl.className = "yes";
+    bigEl.textContent = maxHold >= HOLD_MS ? ("HOLD " + maxHold + "ms")
+                                           : "KEYUP OK";
+    subEl.textContent = (maxHold >= HOLD_MS)
+      ? "hold IS measurable · longest " + maxHold + "ms"
+      : "releases fire · longest so far " + maxHold + "ms";
+  }
+
+  function note(text) {
+    lines.push(text);
+    if (lines.length > 8) lines.shift();
+    logEl.textContent = lines.join("\n");
+  }
+
+  function label(e) {
+    return (e.key === " " ? "Space" : e.key);
+  }
+
+  window.addEventListener("keydown", function (e) {
+    var k = label(e);
+    total++;
+    if (e.repeat) {                   // held keys may auto-repeat instead
+      repeats[k] = (repeats[k] || 0) + 1;
+      paint();
+      return;
+    }
+    sawKeyDown = true;
+    downAt[k] = Date.now();
+    repeats[k] = 0;
+    note("DOWN  " + k + "  [" + (e.code || "?") + "]");
+    paint();
+    e.preventDefault();
+  });
+
+  window.addEventListener("keyup", function (e) {
+    var k = label(e);
+    total++;
+    sawKeyUp = true;
+    var started = downAt[k];
+    var held = started ? (Date.now() - started) : -1;
+    var rpt = repeats[k] || 0;
+    delete downAt[k];
+    repeats[k] = 0;
+
+    if (held > maxHold) maxHold = held;
+    note("UP    " + k + "  " + (held < 0 ? "?" : held + "ms") +
+         (rpt ? "  rpt" + rpt : "") +
+         (held >= HOLD_MS ? "   <-- HOLD" : ""));
+    paint();
+    e.preventDefault();
+  });
+
+  paint();
+})();
+</script>
+</body>
+</html>
