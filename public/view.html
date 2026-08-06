@@ -146,6 +146,39 @@
   #counter   { left: 15px; }
   #zoombadge { right: 15px; display: none; }
   #hud.zoomed #zoombadge { display: block; }
+
+  /* Zoom confirmation. Centred and short-lived: the wearer needs to
+     know which way the ladder just moved, because one gesture drives
+     both directions. Text only, no plate behind it — a filled panel
+     would light pixels across the middle of the photo. */
+  #zoomflash {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font: 600 46px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.06em;
+    color: #fff;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 200ms ease;
+    text-shadow: 0 0 4px rgba(0, 0, 0, 0.95), 0 0 14px rgba(0, 0, 0, 0.7);
+  }
+  #zoomflash.show  { opacity: 1; }
+  #zoomflash.limit { color: #ffcf8a; }   /* amber: end of the ladder */
+
+  /* Only with ?debug=1 — prints raw key names so the wearer can find
+     out what a given gesture actually emits on real hardware. */
+  #debug {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    display: none;
+    font: 400 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #7fe08a;
+    white-space: pre;
+    text-shadow: 0 0 3px rgba(0, 0, 0, 0.95);
+  }
 </style>
 
 <!-- Script order matches index.html exactly:
@@ -177,6 +210,11 @@
       <div id="counter"></div>
       <div id="zoombadge"></div>
     </div>
+
+    <!-- Outside #hud: zoom feedback must not inherit the HUD's idle
+         fade, and must show even after the arrows have gone. -->
+    <div id="zoomflash"></div>
+    <div id="debug"></div>
   </div>
 
 <script>
@@ -213,6 +251,22 @@
   // The gallery's first paint holds the arrows longer, so the swipe
   // affordance registers before it disappears.
   const HUD_INTRO_MS = 5200;
+
+  // How long the +/- zoom confirmation stays up.
+  const ZOOM_FLASH_MS = 950;
+
+  // The glasses expose a D-pad only: four arrows plus Enter reach the
+  // page, and nothing else does (Meta's Web App docs — the band's
+  // twist/rotate is a system gesture that never arrives here). With a
+  // single key driving zoom, a ladder that only ever climbed and then
+  // snapped 4x -> 1x left no way to step back down. It now reverses at
+  // each end instead: 1 -> 1.5 -> 2.5 -> 4 -> 2.5 -> 1.5 -> 1 -> ...
+  // so the same pinch walks both directions, and the +/- flash says
+  // which way it is heading. Set false to restore the wrapping cycle.
+  const ZOOM_PING_PONG = true;
+
+  // ?debug=1 prints every key the page receives, bound or not.
+  const DEBUG = /[?&]debug=1(&|$)/.test(window.location.search);
 
   // Contrast boost for the waveguide, which washes out midtones in
   // ambient light. 1.35 visibly separates midtones while staying
@@ -274,7 +328,16 @@
     right: document.querySelector('.arrow[data-dir="right"]')
   };
 
-  let hudTimer = null;
+  const flashEl = document.getElementById("zoomflash");
+  const debugEl = document.getElementById("debug");
+
+  let hudTimer   = null;
+  let flashTimer = null;
+  const debugLines = [];
+
+  // Which way the next Enter walks the zoom ladder. Flips on reaching
+  // either end; reset to "in" whenever the viewport resets.
+  let zoomDir = +1;
 
   /* ============================================================
      SUPABASE
@@ -360,6 +423,7 @@
     zoomScale = 1;
     panX = 0;
     panY = 0;
+    zoomDir = +1;        // a fresh photo always zooms in first
   }
 
   // Recomputed on every image load: the contain-fit of the natural
@@ -489,15 +553,56 @@
     return true;
   }
 
-  function advanceZoom() {
-    const at = ZOOM_LADDER.indexOf(zoomScale);
-    const nextIdx = ((at === -1 ? 0 : at) + 1) % ZOOM_LADDER.length;
-    zoomScale = ZOOM_LADDER[nextIdx];
-    if (zoomScale === 1) { panX = 0; panY = 0; }  // wrapped past 4 -> back to BROWSE
+  // Every zoom path funnels through here, so the ladder cycle and the
+  // discrete out-step can never leave different state behind.
+  function commitZoom(nextScale) {
+    const prev = zoomScale;
+    zoomScale = nextScale;
+    if (zoomScale === 1) { panX = 0; panY = 0; }   // back to BROWSE
     clampPan();
     applyTransform();
+    flashZoom(nextScale > prev ? +1 : -1, false);
     render();
     return true;
+  }
+
+  function ladderIndex() {
+    const at = ZOOM_LADDER.indexOf(zoomScale);
+    return at === -1 ? 0 : at;
+  }
+
+  // Enter / pinch. Walks the ladder, reversing at each end so one key
+  // covers both directions (see ZOOM_PING_PONG).
+  function advanceZoom() {
+    const cur = ladderIndex();
+    const last = ZOOM_LADDER.length - 1;
+
+    if (!ZOOM_PING_PONG) {
+      return commitZoom(ZOOM_LADDER[(cur + 1) % ZOOM_LADDER.length]);
+    }
+
+    let next = cur + zoomDir;
+    if (next > last)      { zoomDir = -1; next = cur - 1; }   // bounce off 4x
+    else if (next < 0)    { zoomDir = +1; next = cur + 1; }   // bounce off 1x
+    if (next === cur) return false;                           // 1-rung ladder
+    return commitZoom(ZOOM_LADDER[next]);
+  }
+
+  // An explicit "step out" for hosts that can deliver a second key.
+  // Clamps at 1x rather than wrapping: a dedicated out control that
+  // jumped to maximum zoom would be a nasty surprise.
+  function zoomOut() {
+    const cur = ladderIndex();
+    if (cur === 0) { flashZoom(-1, true); return false; }
+    zoomDir = -1;                    // keep the pinch walking the same way
+    return commitZoom(ZOOM_LADDER[cur - 1]);
+  }
+
+  function zoomIn() {
+    const cur = ladderIndex();
+    if (cur === ZOOM_LADDER.length - 1) { flashZoom(+1, true); return false; }
+    zoomDir = +1;
+    return commitZoom(ZOOM_LADDER[cur + 1]);
   }
 
   function panBy(dirX, dirY) {
@@ -536,7 +641,16 @@
     "c":          "CONTRAST",
     "C":          "CONTRAST",
     "r":          "RESET",
-    "R":          "RESET"
+    "R":          "RESET",
+
+    // Only the arrows and Enter are guaranteed on-device. The rest are
+    // for desktop testing, and are free wins if a firmware update ever
+    // starts delivering them — none collides with a D-pad key.
+    "Escape":     "ZOOM_OUT",
+    "-":          "ZOOM_OUT",
+    "_":          "ZOOM_OUT",
+    "+":          "ZOOM_IN",
+    "=":          "ZOOM_IN"
   };
 
   // The one funnel every input passes through — keyboard and the
@@ -547,9 +661,11 @@
     const now = (window.performance && performance.now) ? performance.now() : Date.now();
     if (now - lastActionAt < INPUT_DEBOUNCE_MS) return false;
 
-    // ERROR is terminal except for retry.
+    // ERROR is terminal except for retry. Enter counts as well as R:
+    // on the glasses R is unreachable, so an R-only retry would have
+    // stranded the wearer in ERROR with no way out but restarting.
     if (appState === APP.ERROR) {
-      if (action !== "RESET") return false;
+      if (action !== "RESET" && action !== "SELECT") return false;
       lastActionAt = now;
       loadGallery();
       return true;
@@ -573,6 +689,8 @@
       case "UP":       handled = zoomed ? panBy(0, -1) : changePage(-1); break;
       case "DOWN":     handled = zoomed ? panBy(0, +1) : changePage(+1); break;
       case "SELECT":   handled = advanceZoom();     break;
+      case "ZOOM_IN":  handled = zoomIn();          break;
+      case "ZOOM_OUT": handled = zoomOut();         break;
       case "CONTRAST": handled = toggleContrast();  break;
       case "RESET":    handled = resetViewportAction(); break;
     }
@@ -589,6 +707,14 @@
   }
 
   window.addEventListener("keydown", function (e) {
+    // Logged before the bound/unbound test on purpose: the point of
+    // ?debug=1 is to reveal keys we do NOT already handle.
+    debugNote(
+      (e.key === " " ? "Space" : e.key) +
+      "  [" + (e.code || "?") + "]  " +
+      (KEY_ACTIONS[e.key] ? "-> " + KEY_ACTIONS[e.key] : "unbound")
+    );
+
     if (e.repeat) return;                         // native key-repeat safeguard
     const action = KEY_ACTIONS[e.key];
     if (!action) return;
@@ -608,6 +734,8 @@
     next:          function () { return dispatch("RIGHT"); },
     prev:          function () { return dispatch("LEFT"); },
     toggleZoom:    function () { return dispatch("SELECT"); },
+    zoomIn:        function () { return dispatch("ZOOM_IN"); },
+    zoomOut:       function () { return dispatch("ZOOM_OUT"); },
     cycleContrast: function () { return dispatch("CONTRAST"); },
     // Flash the arrows without performing an action — for a host that
     // wants to surface them on, say, a wake or a raise-to-look gesture.
@@ -650,6 +778,29 @@
 
   function formatZoom(z) {
     return String(z) + "×";       // 1.5 -> "1.5×"
+  }
+
+  // The wearer's only zoom control is a single key that changes
+  // direction, so the direction has to be shown, not inferred.
+  // atLimit renders amber to distinguish "went out to 1x" from
+  // "asked to go out, already at 1x".
+  function flashZoom(dir, atLimit) {
+    flashEl.textContent = (dir > 0 ? "+" : "−") + " " + formatZoom(zoomScale);
+    flashEl.classList.toggle("limit", !!atLimit);
+    flashEl.classList.add("show");
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(function () {
+      flashEl.classList.remove("show");
+      flashTimer = null;
+    }, ZOOM_FLASH_MS);
+  }
+
+  function debugNote(line) {
+    if (!DEBUG) return;
+    debugLines.push(line);
+    if (debugLines.length > 9) debugLines.shift();
+    debugEl.textContent = debugLines.join("\n");
+    debugEl.style.display = "block";
   }
 
   function updateHud() {
@@ -714,7 +865,7 @@
 
       case APP.ERROR:
         photoEl.style.display = "none";
-        showOverlay("Could not load gallery\n" + errorText + "\n\nPress R to retry", true);
+        showOverlay("Could not load gallery\n" + errorText + "\n\nPinch to retry", true);
         break;
 
       case APP.EMPTY:
