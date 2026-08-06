@@ -79,6 +79,73 @@
   }
   #overlay.visible { display: flex; }
   #overlay.error   { color: #b4726a; }
+
+  /* ==========================================================
+     HUD  —  swipe affordances
+     ----------------------------------------------------------
+     Transient by design. Persistent chrome on a waveguide both
+     occludes the photo and costs power on every lit pixel, so
+     the HUD appears on interaction and fades once the wearer is
+     just looking. Arrows are drawn ONLY in the directions that
+     will actually do something, which turns them into a
+     position readout too: no left chevron means first photo.
+     ========================================================== */
+  #hud {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;             /* no pointer exists on-device */
+    opacity: 0;
+    transition: opacity 260ms ease;
+  }
+  #hud.show { opacity: 1; }
+
+  .arrow {
+    position: absolute;
+    width: 40px;
+    height: 40px;
+    display: none;                    /* JS opts each direction in */
+  }
+  .arrow.on { display: block; }
+  .arrow svg { display: block; width: 100%; height: 100%; }
+
+  /* Stroke, not fill: a hairline outline survives the waveguide's
+     midtone washout better than a solid glyph, and the doubled
+     dark drop-shadow keeps it legible over a blown-out sky. */
+  .arrow path {
+    fill: none;
+    stroke: #fff;
+    stroke-width: 2.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.9))
+            drop-shadow(0 0 9px rgba(0, 0, 0, 0.55));
+  }
+
+  /* One glyph authored pointing right, then rotated into place —
+     the four arrows can never drift out of sync. */
+  .arrow[data-dir="right"] { right: 10px; top: 50%;    transform: translateY(-50%); }
+  .arrow[data-dir="left"]  { left: 10px;  top: 50%;    transform: translateY(-50%) rotate(180deg); }
+  .arrow[data-dir="down"]  { bottom: 10px; left: 50%;  transform: translateX(-50%) rotate(90deg); }
+  .arrow[data-dir="up"]    { top: 10px;   left: 50%;   transform: translateX(-50%) rotate(-90deg); }
+
+  /* BROWSE shows a bare chevron (discrete step to the next photo);
+     ZOOMED shows a shafted arrow (continuous glide across one
+     photo). The mode is legible before you commit to a swipe. */
+  .g-pan { display: none; }
+  #hud.zoomed .g-page { display: none; }
+  #hud.zoomed .g-pan  { display: inline; }
+
+  #counter, #zoombadge {
+    position: absolute;
+    top: 13px;
+    font: 500 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.08em;
+    color: #fff;
+    text-shadow: 0 0 3px rgba(0, 0, 0, 0.95), 0 0 9px rgba(0, 0, 0, 0.6);
+  }
+  #counter   { left: 15px; }
+  #zoombadge { right: 15px; display: none; }
+  #hud.zoomed #zoombadge { display: block; }
 </style>
 
 <!-- Script order matches index.html exactly:
@@ -91,6 +158,25 @@
   <div id="stage">
     <img id="photo" alt="">
     <div id="overlay"></div>
+
+    <!-- Both glyphs ship in every arrow; CSS reveals the one matching
+         the current mode, so switching modes costs no DOM work. -->
+    <div id="hud" aria-hidden="true">
+      <div class="arrow" data-dir="up">
+        <svg viewBox="0 0 24 24"><path class="g-page" d="M9 4.5 16.5 12 9 19.5"/><path class="g-pan" d="M4 12h14.5m-6-6 6 6-6 6"/></svg>
+      </div>
+      <div class="arrow" data-dir="down">
+        <svg viewBox="0 0 24 24"><path class="g-page" d="M9 4.5 16.5 12 9 19.5"/><path class="g-pan" d="M4 12h14.5m-6-6 6 6-6 6"/></svg>
+      </div>
+      <div class="arrow" data-dir="left">
+        <svg viewBox="0 0 24 24"><path class="g-page" d="M9 4.5 16.5 12 9 19.5"/><path class="g-pan" d="M4 12h14.5m-6-6 6 6-6 6"/></svg>
+      </div>
+      <div class="arrow" data-dir="right">
+        <svg viewBox="0 0 24 24"><path class="g-page" d="M9 4.5 16.5 12 9 19.5"/><path class="g-pan" d="M4 12h14.5m-6-6 6 6-6 6"/></svg>
+      </div>
+      <div id="counter"></div>
+      <div id="zoombadge"></div>
+    </div>
   </div>
 
 <script>
@@ -118,6 +204,15 @@
   // Hardware bounce suppression: a keydown arriving less than this
   // long after the last *processed* one is dropped outright.
   const INPUT_DEBOUNCE_MS = 150;
+
+  // How long the swipe arrows linger after the last action before
+  // fading out, leaving the photo unobstructed. Set to 0 to pin the
+  // HUD on permanently.
+  const HUD_IDLE_MS = 2600;
+
+  // The gallery's first paint holds the arrows longer, so the swipe
+  // affordance registers before it disappears.
+  const HUD_INTRO_MS = 5200;
 
   // Contrast boost for the waveguide, which washes out midtones in
   // ambient light. 1.35 visibly separates midtones while staying
@@ -169,6 +264,17 @@
 
   const photoEl   = document.getElementById("photo");
   const overlayEl = document.getElementById("overlay");
+  const hudEl     = document.getElementById("hud");
+  const counterEl = document.getElementById("counter");
+  const zoomEl    = document.getElementById("zoombadge");
+  const arrowEls  = {
+    up:    document.querySelector('.arrow[data-dir="up"]'),
+    down:  document.querySelector('.arrow[data-dir="down"]'),
+    left:  document.querySelector('.arrow[data-dir="left"]'),
+    right: document.querySelector('.arrow[data-dir="right"]')
+  };
+
+  let hudTimer = null;
 
   /* ============================================================
      SUPABASE
@@ -236,6 +342,7 @@
       resetViewport();
       appState = APP.READY;
       showCurrentPage();
+      bumpHud(HUD_INTRO_MS);   // hold the affordance longer on first paint
 
     } catch (err) {
       clearPrefetch();
@@ -270,11 +377,20 @@
   // independently per axis. An axis whose scaled extent still fits
   // inside the viewport has maxPan 0 and is pinned to centre — there
   // is nothing off-screen to reveal on it.
+  // Single source of truth for the bounds: the clamp and the HUD's
+  // "is there anything left that way?" test read the same numbers,
+  // so an arrow can never point somewhere the clamp refuses to go.
+  function panLimits() {
+    return {
+      x: Math.max(0, (renderedW * zoomScale - VIEWPORT_W) / 2),
+      y: Math.max(0, (renderedH * zoomScale - VIEWPORT_H) / 2)
+    };
+  }
+
   function clampPan() {
-    const maxPanX = Math.max(0, (renderedW * zoomScale - VIEWPORT_W) / 2);
-    const maxPanY = Math.max(0, (renderedH * zoomScale - VIEWPORT_H) / 2);
-    panX = Math.min(maxPanX, Math.max(-maxPanX, panX));
-    panY = Math.min(maxPanY, Math.max(-maxPanY, panY));
+    const lim = panLimits();
+    panX = Math.min(lim.x, Math.max(-lim.x, panX));
+    panY = Math.min(lim.y, Math.max(-lim.y, panY));
   }
 
   // translate BEFORE scale: CSS applies the translation in the
@@ -356,6 +472,7 @@
     if (appState === APP.READY) {
       showOverlay("Image unavailable\n" + (pageIndex + 1) + " / " + photos.length, false);
       photoEl.style.display = "none";
+      bumpHud();               // show the way out of a broken page
     }
   });
 
@@ -464,6 +581,10 @@
     // a clamped edge does not start a debounce window that would eat
     // the wearer's next, valid press.
     if (handled) lastActionAt = now;
+
+    // Surface the arrows even when nothing moved: a press that hits a
+    // boundary is precisely when it helps to see which ways are left.
+    bumpHud();
     return handled;
   }
 
@@ -487,12 +608,91 @@
     next:          function () { return dispatch("RIGHT"); },
     prev:          function () { return dispatch("LEFT"); },
     toggleZoom:    function () { return dispatch("SELECT"); },
-    cycleContrast: function () { return dispatch("CONTRAST"); }
+    cycleContrast: function () { return dispatch("CONTRAST"); },
+    // Flash the arrows without performing an action — for a host that
+    // wants to surface them on, say, a wake or a raise-to-look gesture.
+    showHints:     function (ms) { bumpHud(ms); }
   };
 
   /* ============================================================
      RENDER
      ============================================================ */
+
+  /* ============================================================
+     HUD
+     ============================================================ */
+
+  // Which of the four directions would actually do something right
+  // now. In BROWSE that means "is there a photo that way"; in ZOOMED,
+  // "is there image left to reveal that way" — tested against the
+  // very bounds clampPan enforces, so an arrow can never promise a
+  // move the clamp will refuse.
+  function availableDirections() {
+    if (mode() === "ZOOMED") {
+      const lim = panLimits();
+      // Mirrors the dispatch table: LEFT/UP decrease pan, RIGHT/DOWN
+      // increase it, so each stays live until it reaches its own bound.
+      // The comparison is exact on purpose — clampPan pins pan to
+      // precisely +/-lim, so there is no drift to absorb, and a
+      // tolerance band here would hide an arrow while the press it
+      // describes still moves the image.
+      return {
+        left:  panX > -lim.x,
+        right: panX <  lim.x,
+        up:    panY > -lim.y,
+        down:  panY <  lim.y
+      };
+    }
+    const canPrev = pageIndex > 0;
+    const canNext = pageIndex < photos.length - 1;
+    return { left: canPrev, up: canPrev, right: canNext, down: canNext };
+  }
+
+  function formatZoom(z) {
+    return String(z) + "×";       // 1.5 -> "1.5×"
+  }
+
+  function updateHud() {
+    if (appState !== APP.READY) {
+      hudEl.classList.remove("show");
+      if (hudTimer) { clearTimeout(hudTimer); hudTimer = null; }
+      return;
+    }
+
+    const zoomed = mode() === "ZOOMED";
+    hudEl.classList.toggle("zoomed", zoomed);
+
+    const dirs = availableDirections();
+    Object.keys(arrowEls).forEach(function (d) {
+      arrowEls[d].classList.toggle("on", !!dirs[d]);
+    });
+
+    // A single-photo gallery has nothing to count.
+    counterEl.textContent =
+      photos.length > 1 ? (pageIndex + 1) + " / " + photos.length : "";
+    zoomEl.textContent = zoomed ? formatZoom(zoomScale) : "";
+  }
+
+  // Reveal the HUD, then start its fade timer over. Called on every
+  // input that clears debounce — including ones that changed nothing,
+  // because a press that hits a boundary is exactly when the wearer
+  // most needs to see which directions remain.
+  function bumpHud(duration) {
+    updateHud();
+    if (appState !== APP.READY) return;
+
+    hudEl.classList.add("show");
+    if (hudTimer) clearTimeout(hudTimer);
+    hudTimer = null;
+
+    const ms = (duration === undefined) ? HUD_IDLE_MS : duration;
+    if (ms > 0) {
+      hudTimer = setTimeout(function () {
+        hudEl.classList.remove("show");
+        hudTimer = null;
+      }, ms);
+    }
+  }
 
   function showOverlay(text, isError) {
     overlayEl.textContent = text;
@@ -527,6 +727,9 @@
         photoEl.style.display = "block";
         break;
     }
+    // Keeps the arrow set truthful on every state change without
+    // forcing it visible; bumpHud owns visibility.
+    updateHud();
   }
 
   render();
