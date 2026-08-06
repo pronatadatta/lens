@@ -726,17 +726,19 @@
   window.addEventListener("keydown", function (e) {
     const name = (e.key === " ") ? "Space" : e.key;
 
-    if (DEBUG) {
-      if (e.repeat) {
-        keyRepeats[name] = (keyRepeats[name] || 0) + 1;
-      } else {
-        keyHeldSince[name] = Date.now();
-        keyRepeats[name] = 0;
-        // Logged before the bound/unbound test on purpose: the point is
-        // to reveal keys we do NOT already handle.
-        debugNote("↓ " + name + " [" + (e.code || "?") + "] " +
-                  (KEY_ACTIONS[e.key] ? "→ " + KEY_ACTIONS[e.key] : "unbound"));
-      }
+    // The press timestamp must be recorded unconditionally: the keyup
+    // handler measures against it, and on-device DEBUG is always off,
+    // so gating this would make every hold measure as zero and HOLD
+    // could never fire. Only the on-screen logging is DEBUG-gated.
+    if (e.repeat) {
+      keyRepeats[name] = (keyRepeats[name] || 0) + 1;
+    } else {
+      keyHeldSince[name] = Date.now();
+      keyRepeats[name] = 0;
+      // Logged before the bound/unbound test on purpose: the point is
+      // to reveal keys we do NOT already handle.
+      debugNote("↓ " + name + " [" + (e.code || "?") + "] " +
+                (KEY_ACTIONS[e.key] ? "→ " + KEY_ACTIONS[e.key] : "unbound"));
     }
 
     if (e.repeat) return;                         // native key-repeat safeguard
@@ -746,34 +748,46 @@
     dispatch(action);
   });
 
-  // Gated on DEBUG so the shipped input path is byte-for-byte what it
-  // was — this listener is a measurement instrument, not a feature.
-  if (DEBUG) {
-    window.addEventListener("keyup", function (e) {
-      const name = (e.key === " ") ? "Space" : e.key;
-      const started = keyHeldSince[name];
-      const held = started ? (Date.now() - started) : -1;
-      const rpt = keyRepeats[name] || 0;
-      delete keyHeldSince[name];
-      keyRepeats[name] = 0;
+  // Deliberately NOT gated on DEBUG. Only the registered Web App URL
+  // receives the D-pad — a probe at any other path renders but gets no
+  // key events, and ?debug=1 does not survive the trip to the glasses.
+  // So the instrument has to ride along in the shipped page. It reads
+  // nothing and changes no state: it can only flash text.
+  //
+  // Two one-shot announcements, because "no HOLD appeared" is ambiguous
+  // on its own — it looks identical whether holds are unsupported or
+  // the listener never ran. The first keyup ever seen proves the
+  // instrument is live, so a silent HOLD afterwards is a real answer.
+  let announcedKeyup = false;
 
-      debugNote("↑ " + name + "  " + (held < 0 ? "?" : held + "ms") +
-                (rpt ? "  rpt" + rpt : "") +
-                (held >= HOLD_PROBE_MS ? "  ← HOLD" : ""));
+  window.addEventListener("keyup", function (e) {
+    const name = (e.key === " ") ? "Space" : e.key;
+    const started = keyHeldSince[name];
+    const held = started ? (Date.now() - started) : -1;
+    const rpt = keyRepeats[name] || 0;
+    delete keyHeldSince[name];
+    keyRepeats[name] = 0;
 
-      // Announced in the middle of the display so the result is
-      // readable at a glance instead of squinting at the log.
-      if (held >= HOLD_PROBE_MS) {
-        flashEl.classList.remove("limit");
-        flashEl.textContent = "HOLD " + held + "ms";
-        flashEl.classList.add("show");
-        if (flashTimer) clearTimeout(flashTimer);
-        flashTimer = setTimeout(function () {
-          flashEl.classList.remove("show");
-          flashTimer = null;
-        }, 1500);
-      }
-    });
+    debugNote("↑ " + name + "  " + (held < 0 ? "?" : held + "ms") +
+              (rpt ? "  rpt" + rpt : "") +
+              (held >= HOLD_PROBE_MS ? "  ← HOLD" : ""));
+
+    if (held >= HOLD_PROBE_MS)      flashProbe("HOLD " + held + "ms");
+    else if (!announcedKeyup)       flashProbe("KEYUP ✓ " + Math.max(held, 0) + "ms");
+    announcedKeyup = true;
+  });
+
+  // Borrows the zoom flash element rather than adding chrome: this is
+  // temporary instrumentation and should leave no trace once removed.
+  function flashProbe(text) {
+    flashEl.classList.remove("limit");
+    flashEl.textContent = text;
+    flashEl.classList.add("show");
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(function () {
+      flashEl.classList.remove("show");
+      flashTimer = null;
+    }, 1600);
   }
 
   /* ============================================================
