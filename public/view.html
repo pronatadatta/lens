@@ -712,14 +712,32 @@
     return handled;
   }
 
+  // ?debug=1 only. Establishes whether the band reports a pinch as a
+  // keydown/keyup PAIR — if it does, hold duration is measurable in JS
+  // and a long-press menu is possible without any new gesture. If only
+  // down-arrows ever appear in the log, keyup never fires and a hold is
+  // indistinguishable from a tap, which settles the question the other
+  // way. Repeats are counted rather than logged so they cannot flood
+  // the readout.
+  const HOLD_PROBE_MS = 500;
+  const keyHeldSince = Object.create(null);
+  const keyRepeats   = Object.create(null);
+
   window.addEventListener("keydown", function (e) {
-    // Logged before the bound/unbound test on purpose: the point of
-    // ?debug=1 is to reveal keys we do NOT already handle.
-    debugNote(
-      (e.key === " " ? "Space" : e.key) +
-      "  [" + (e.code || "?") + "]  " +
-      (KEY_ACTIONS[e.key] ? "-> " + KEY_ACTIONS[e.key] : "unbound")
-    );
+    const name = (e.key === " ") ? "Space" : e.key;
+
+    if (DEBUG) {
+      if (e.repeat) {
+        keyRepeats[name] = (keyRepeats[name] || 0) + 1;
+      } else {
+        keyHeldSince[name] = Date.now();
+        keyRepeats[name] = 0;
+        // Logged before the bound/unbound test on purpose: the point is
+        // to reveal keys we do NOT already handle.
+        debugNote("↓ " + name + " [" + (e.code || "?") + "] " +
+                  (KEY_ACTIONS[e.key] ? "→ " + KEY_ACTIONS[e.key] : "unbound"));
+      }
+    }
 
     if (e.repeat) return;                         // native key-repeat safeguard
     const action = KEY_ACTIONS[e.key];
@@ -727,6 +745,36 @@
     e.preventDefault();
     dispatch(action);
   });
+
+  // Gated on DEBUG so the shipped input path is byte-for-byte what it
+  // was — this listener is a measurement instrument, not a feature.
+  if (DEBUG) {
+    window.addEventListener("keyup", function (e) {
+      const name = (e.key === " ") ? "Space" : e.key;
+      const started = keyHeldSince[name];
+      const held = started ? (Date.now() - started) : -1;
+      const rpt = keyRepeats[name] || 0;
+      delete keyHeldSince[name];
+      keyRepeats[name] = 0;
+
+      debugNote("↑ " + name + "  " + (held < 0 ? "?" : held + "ms") +
+                (rpt ? "  rpt" + rpt : "") +
+                (held >= HOLD_PROBE_MS ? "  ← HOLD" : ""));
+
+      // Announced in the middle of the display so the result is
+      // readable at a glance instead of squinting at the log.
+      if (held >= HOLD_PROBE_MS) {
+        flashEl.classList.remove("limit");
+        flashEl.textContent = "HOLD " + held + "ms";
+        flashEl.classList.add("show");
+        if (flashTimer) clearTimeout(flashTimer);
+        flashTimer = setTimeout(function () {
+          flashEl.classList.remove("show");
+          flashTimer = null;
+        }, 1500);
+      }
+    });
+  }
 
   /* ============================================================
      HOST INTERFACE
