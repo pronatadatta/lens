@@ -321,8 +321,11 @@
   // INPUT_DEBOUNCE_MS so hardware bounce cannot open the menu; the
   // upper bound stays short enough that two deliberate zooms are not
   // swallowed as one gesture.
+  // 500ms was a touchscreen double-tap figure and proved far too tight:
+  // an EMG pinch carries recognition latency on each gesture, so two
+  // deliberate pinches land much further apart than two taps do.
   const DOUBLE_PINCH_MIN_MS = 170;
-  const DOUBLE_PINCH_MAX_MS = 500;
+  const DOUBLE_PINCH_MAX_MS = 900;
 
   // Contrast boost for the waveguide, which washes out midtones in
   // ambient light. 1.35 visibly separates midtones while staying
@@ -1011,6 +1014,7 @@
   // worth of lag on every single zoom.
   let lastPinchAt = 0;
   let preZoom = null;
+  let lastGapMs = 0;        // ms since the previous pinch, shown in the flash
 
   function undoPendingZoom() {
     if (!preZoom) return;
@@ -1048,8 +1052,22 @@
     if (action === "SELECT" && !menuOpen && appState === APP.READY) {
       const now = Date.now();
       const gap = now - lastPinchAt;
-      if (gap >= DOUBLE_PINCH_MIN_MS && gap <= DOUBLE_PINCH_MAX_MS) {
+
+      // Surfaced in the zoom flash so the real cadence is measurable on
+      // the hardware instead of guessed at. Anything longer than this
+      // is a fresh gesture, not the second half of a double.
+      lastGapMs = (gap > 0 && gap < 4000) ? Math.round(gap) : 0;
+
+      // Only from 1x. A window wide enough for a comfortable double
+      // pinch is also wide enough to swallow ordinary ladder-walking,
+      // so above 1x repeated pinches always mean zoom and never a menu.
+      // The cost is bounded: from 1x you pause briefly before the
+      // second zoom step, and nothing above 1x changes at all.
+      const eligible = (zoomScale === 1) || (preZoom && preZoom.zoomScale === 1);
+
+      if (eligible && gap >= DOUBLE_PINCH_MIN_MS && gap <= DOUBLE_PINCH_MAX_MS) {
         lastPinchAt = 0;
+        lastGapMs = 0;
         undoPendingZoom();      // give back the zoom the first pinch took
         openMenu();
         return;
@@ -1124,7 +1142,11 @@
   // atLimit renders amber to distinguish "went out to 1x" from
   // "asked to go out, already at 1x".
   function flashZoom(dir, atLimit) {
-    flashEl.textContent = (dir > 0 ? "+" : "−") + " " + formatZoom(zoomScale);
+    // The gap rides along with the zoom readout rather than replacing
+    // it: the zoom feedback stays intact while the pinch cadence
+    // becomes visible, which is the number needed to tune the window.
+    flashEl.textContent = (dir > 0 ? "+" : "−") + " " + formatZoom(zoomScale) +
+                          (lastGapMs ? "  " + lastGapMs + "ms" : "");
     flashEl.classList.toggle("limit", !!atLimit);
     flashEl.classList.add("show");
     if (flashTimer) clearTimeout(flashTimer);
