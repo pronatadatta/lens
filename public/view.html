@@ -679,15 +679,21 @@
     let handled = false;
 
     switch (action) {
-      case "LEFT":     handled = zoomed ? panBy(-1, 0) : changePage(-1); break;
-      case "RIGHT":    handled = zoomed ? panBy(+1, 0) : changePage(+1); break;
+      // Pan follows a "look around" model: a swipe moves the wearer's
+      // viewpoint that way, so swiping left reveals what sits off the
+      // left edge. Moving the view one way means translating the image
+      // the other, which is why these signs oppose the direction named.
+      // availableDirections() derives its bounds test from exactly
+      // these signs — flip one and you must flip the other.
+      case "LEFT":     handled = zoomed ? panBy(+1, 0) : changePage(-1); break;
+      case "RIGHT":    handled = zoomed ? panBy(-1, 0) : changePage(+1); break;
       // In BROWSE the vertical axis is a second way to page, so a
       // swipe pages without having to find the horizontal axis first.
       // Down advances and up goes back, matching right/left. To invert,
       // swap the two changePage signs below — nothing else reads this
       // convention. In ZOOMED the axis still pans, unchanged.
-      case "UP":       handled = zoomed ? panBy(0, -1) : changePage(-1); break;
-      case "DOWN":     handled = zoomed ? panBy(0, +1) : changePage(+1); break;
+      case "UP":       handled = zoomed ? panBy(0, +1) : changePage(-1); break;
+      case "DOWN":     handled = zoomed ? panBy(0, -1) : changePage(+1); break;
       case "SELECT":   handled = advanceZoom();     break;
       case "ZOOM_IN":  handled = zoomIn();          break;
       case "ZOOM_OUT": handled = zoomOut();         break;
@@ -758,17 +764,17 @@
   function availableDirections() {
     if (mode() === "ZOOMED") {
       const lim = panLimits();
-      // Mirrors the dispatch table: LEFT/UP decrease pan, RIGHT/DOWN
-      // increase it, so each stays live until it reaches its own bound.
-      // The comparison is exact on purpose — clampPan pins pan to
-      // precisely +/-lim, so there is no drift to absorb, and a
-      // tolerance band here would hide an arrow while the press it
-      // describes still moves the image.
+      // Mirrors the dispatch table under the look-around model: LEFT/UP
+      // *increase* pan and RIGHT/DOWN decrease it, so each stays live
+      // until it reaches its own bound. The comparison is exact on
+      // purpose — clampPan pins pan to precisely +/-lim, so there is no
+      // drift to absorb, and a tolerance band here would hide an arrow
+      // while the press it describes still moves the image.
       return {
-        left:  panX > -lim.x,
-        right: panX <  lim.x,
-        up:    panY > -lim.y,
-        down:  panY <  lim.y
+        left:  panX <  lim.x,
+        right: panX > -lim.x,
+        up:    panY <  lim.y,
+        down:  panY > -lim.y
       };
     }
     const canPrev = pageIndex > 0;
