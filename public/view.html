@@ -145,6 +145,19 @@
   #hud:not(.zoomed) .arrow[data-dir="up"] .g-page { display: none; }
   #hud:not(.zoomed) .arrow[data-dir="up"] .g-menu { display: inline; }
 
+  /* Build stamp. Small and dim, but always present while the HUD is up:
+     without it, "it still does X" is unanswerable — a stale page and a
+     genuine bug look identical from a description. */
+  #build {
+    position: absolute;
+    left: 15px;
+    bottom: 13px;
+    font: 500 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.08em;
+    color: rgba(255, 255, 255, 0.5);
+    text-shadow: 0 0 3px rgba(0, 0, 0, 0.95);
+  }
+
   #counter, #zoombadge {
     position: absolute;
     top: 13px;
@@ -312,6 +325,7 @@
       </div>
       <div id="counter"></div>
       <div id="zoombadge"></div>
+      <div id="build"></div>
     </div>
 
     <!-- Outside #hud: zoom feedback must not inherit the HUD's idle
@@ -377,6 +391,12 @@
 
   // ?debug=1 prints every key the page receives, bound or not.
   const DEBUG = /[?&]debug=1(&|$)/.test(window.location.search);
+
+  // Bump on every deploy that changes behaviour. Shown in the HUD so a
+  // report of "it still does X" can be tied to a specific build rather
+  // than guessed at — a stale page and a real bug read identically from
+  // a description otherwise.
+  const BUILD = "b11";
 
   // Days a photo sits in the bin before it is purged for good.
   const BIN_RETENTION_DAYS = 7;
@@ -482,6 +502,8 @@
     left:  document.querySelector('.arrow[data-dir="left"]'),
     right: document.querySelector('.arrow[data-dir="right"]')
   };
+
+  document.getElementById("build").textContent = BUILD;
 
   const flashEl = document.getElementById("zoomflash");
   const menuEl  = document.getElementById("menu");
