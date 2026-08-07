@@ -242,6 +242,15 @@
   var BUCKET = window.SUPABASE_BUCKET || "lens";
   var SELECT_COLUMNS = 'id, storage_path, "order", display_name, created_at';
 
+  // Re-encode before upload. Phone screenshots arrive as multi-megabyte
+  // PNGs — a format that is dreadful for photographs — and originals were
+  // going up untouched, which is how this gallery reached 15.9 MB for seven
+  // images. Matches Lawrence's DisplayImage: the viewer's stage is 600px
+  // and its zoom tops out at 4x, so past ~2400px no byte can reach a lens
+  // pixel. Drawing through a canvas also bakes in EXIF orientation.
+  var MAX_UPLOAD_DIMENSION = 2048;
+  var UPLOAD_QUALITY = 0.82;
+
   var sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
   var fileInput = document.getElementById("file-input");
@@ -269,6 +278,57 @@
   function publicUrlFor(path) {
     return sb.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
   }
+
+  // Downscales and re-encodes to JPEG. Resolves to null on any failure so
+  // the caller can fall back to the original file — a photo that uploads
+  // large beats one that does not upload at all.
+  function encodeForUpload(file) {
+    return new Promise(function (resolve) {
+      var objectUrl = URL.createObjectURL(file);
+      var img = new Image();
+
+      img.onload = function () {
+        try {
+          var longest = Math.max(img.naturalWidth, img.naturalHeight);
+          if (!longest) { URL.revokeObjectURL(objectUrl); return resolve(null); }
+
+          var scale = Math.min(1, MAX_UPLOAD_DIMENSION / longest);  // never upscale
+          var w = Math.round(img.naturalWidth * scale);
+          var h = Math.round(img.naturalHeight * scale);
+
+          var canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          var ctx = canvas.getContext("2d");
+          // JPEG has no alpha; without this, transparent PNG regions
+          // encode as black instead of white.
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          URL.revokeObjectURL(objectUrl);
+
+          canvas.toBlob(function (blob) {
+            // Guard the pathological case: a small, already-optimised JPEG
+            // can come out bigger after a round trip. Keep the smaller one.
+            resolve(blob && blob.size < file.size ? blob : null);
+          }, "image/jpeg", UPLOAD_QUALITY);
+        } catch (err) {
+          URL.revokeObjectURL(objectUrl);
+          resolve(null);
+        }
+      };
+
+      // Formats the browser cannot decode (some HEIC) land here.
+      img.onerror = function () {
+        URL.revokeObjectURL(objectUrl);
+        resolve(null);
+      };
+
+      img.src = objectUrl;
+    });
+  }
+
+  function kb(bytes) { return Math.round(bytes / 1024) + " KB"; }
 
   function toast(msg) {
     toastEl.textContent = msg;
@@ -435,23 +495,42 @@
     // Sequential (not parallel) — order must increment predictably per
     // file, and it keeps memory/network use bounded on a phone connection.
     var chain = Promise.resolve();
+    var savedBytes = 0;
     files.forEach(function (file) {
       chain = chain.then(function () {
-        var path = crypto.randomUUID() + "-" + sanitizeFilename(file.name);
         var order = nextOrder;
         nextOrder += 1;
 
-        return sb.storage
-          .from(BUCKET)
-          .upload(path, file, { contentType: file.type || "application/octet-stream", upsert: false })
-          .then(function (uploadRes) {
-            if (uploadRes.error) throw uploadRes.error;
-            return sb
-              .from("photos")
-              .insert({ storage_path: path, order: order, display_name: file.name })
-              .select(SELECT_COLUMNS)
-              .single();
-          })
+        setUploading(true, "Preparing " + (done + 1) + "/" + files.length + "…");
+
+        return encodeForUpload(file).then(function (encoded) {
+          // Null means the browser could not decode it, or re-encoding made
+          // it bigger. Either way the original goes up unchanged.
+          var body = encoded || file;
+          var type = encoded ? "image/jpeg" : (file.type || "application/octet-stream");
+          var base = sanitizeFilename(file.name);
+          // The stored name has to match the bytes, or the transform
+          // endpoint and every browser will trust the wrong decoder.
+          var path = crypto.randomUUID() + "-" +
+                     (encoded ? base.replace(/\.[^.]+$/, "") + ".jpg" : base);
+
+          if (encoded) savedBytes += (file.size - encoded.size);
+          setUploading(true, "Uploading " + (done + 1) + "/" + files.length +
+                             " · " + kb(body.size) +
+                             (encoded ? " (was " + kb(file.size) + ")" : ""));
+
+          return sb.storage
+            .from(BUCKET)
+            .upload(path, body, { contentType: type, upsert: false })
+            .then(function (uploadRes) {
+              if (uploadRes.error) throw uploadRes.error;
+              return sb
+                .from("photos")
+                .insert({ storage_path: path, order: order, display_name: file.name })
+                .select(SELECT_COLUMNS)
+                .single();
+            });
+        })
           .then(function (insertRes) {
             if (insertRes.error) throw insertRes.error;
             photos.push(insertRes.data);
@@ -461,7 +540,6 @@
           })
           .then(function () {
             done += 1;
-            setUploading(true, "Uploading " + done + "/" + files.length + "…");
           });
       });
     });
@@ -469,6 +547,7 @@
     return chain.then(function () {
       setUploading(false);
       render();
+      if (savedBytes > 0) toast("Saved " + kb(savedBytes) + " by re-encoding");
     });
   }
 
