@@ -440,6 +440,7 @@
   let textOpen  = false;
   let textPage  = 0;
   let textPages = 1;
+  let textLabel = "TEXT";      // names what the pane is currently showing
 
   // READY-only viewport state.
   let pageIndex  = 0;
@@ -554,6 +555,7 @@
     const s = blob.toLowerCase();
     return s.indexOf("deleted_at") !== -1 ||
            s.indexOf("ocr_text") !== -1 ||
+           s.indexOf("summary") !== -1 ||
            s.indexOf("42703") !== -1;     // undefined_column
   }
 
@@ -568,7 +570,7 @@
       // migration, so if one is missing the fallback below covers both and
       // the reader simply never offers itself.
       let q = c.from("photos")
-               .select('id, storage_path, "order", display_name, deleted_at, ocr_text');
+               .select('id, storage_path, "order", display_name, deleted_at, ocr_text, summary');
       q = (collection === "bin") ? q.not("deleted_at", "is", null)
                                  : q.is("deleted_at", null);
       const { data, error } = await q.order('"order"', { ascending: true });
@@ -919,7 +921,16 @@
       // never a dead end. Photos uploaded before Lawrence existed, and any
       // Vision found nothing in, simply do not show it.
       if (currentText()) {
-        rows.push({ label: "Read text", run: openTextReader });
+        rows.push({
+          label: "Read text",
+          run: function () { return openTextReader(currentText(), "TEXT"); }
+        });
+        // Two labels, not one: a cached summary opens instantly and costs
+        // nothing, while generating one is a paid round trip. The wearer
+        // should be able to tell which they are about to do.
+        rows.push(summaryOf(photos[pageIndex])
+          ? { label: "Read summary", run: readSummary }
+          : { label: "Summarize",    run: requestSummary });
       }
       // Both entries depend on the migration; without it the menu is
       // just Cancel, which is honest rather than offering a dead action.
@@ -1075,11 +1086,15 @@
     return textOf(photos[pageIndex]);
   }
 
-  function openTextReader() {
-    const body = currentText();
+  /// Opens the reader on arbitrary text. `label` names what is being read,
+  /// since the same pane now serves both the raw OCR and its summary and
+  /// they would otherwise be indistinguishable.
+  function openTextReader(body, label) {
+    body = (body || "").trim();
     if (!body) return false;               // menu hides the row, but be safe
 
     closeMenuSilently();
+    textLabel = label || "TEXT";
     textBodyEl.textContent = body;
     textOpen = true;
     textPage = 0;
@@ -1113,6 +1128,85 @@
     return true;
   }
 
+  /* ---------- summary ---------- */
+
+  function summaryOf(photo) {
+    return (photo && typeof photo.summary === "string")
+      ? photo.summary.trim()
+      : "";
+  }
+
+  function readSummary() {
+    return openTextReader(summaryOf(photos[pageIndex]), "SUMMARY");
+  }
+
+  /// Asks the server to summarize this photo's stored text. The Groq key
+  /// lives only in that function's environment — the viewer is public, so
+  /// it can never hold one. The result is cached onto the row server-side,
+  /// so this is paid for once per photo, ever.
+  async function requestSummary() {
+    const photo = photos[pageIndex];
+    if (!photo) return false;
+
+    closeMenuSilently();
+    showOverlay("Summarizing…", false);
+    photoEl.style.display = "none";
+    render();
+
+    const wanted = photo.id;      // guards a reply that outlives the page
+    try {
+      const response = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ photo_id: photo.id })
+      });
+      const payload = await response.json().catch(function () { return {}; });
+
+      if (!response.ok || !payload.summary) {
+        throw new Error(payload.error || ("HTTP " + response.status));
+      }
+
+      // Mirror it locally so re-opening within this session skips the round
+      // trip entirely — the server already cached it to the row.
+      photo.summary = payload.summary;
+
+      // Paging away while the request was in flight means this summary is
+      // no longer what is on screen; the row keeps it for next time.
+      if (!photos[pageIndex] || photos[pageIndex].id !== wanted) {
+        hideOverlay();
+        photoEl.style.display = "block";
+        render();
+        return true;
+      }
+
+      hideOverlay();
+      photoEl.style.display = "block";
+      openTextReader(payload.summary, "SUMMARY");
+      return true;
+    } catch (err) {
+      hideOverlay();
+      photoEl.style.display = "block";
+      render();
+      flashProblem((err && err.message) || "Summarize failed");
+      return true;
+    }
+  }
+
+  /// Transient failure notice. Borrows the zoom flash rather than the
+  /// ERROR state: the gallery is fine, one optional action just did not
+  /// work, and dropping the wearer into a terminal screen for that would
+  /// be out of proportion.
+  function flashProblem(text) {
+    flashEl.classList.add("limit");        // amber
+    flashEl.textContent = String(text).slice(0, 42);
+    flashEl.classList.add("show");
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(function () {
+      flashEl.classList.remove("show", "limit");
+      flashTimer = null;
+    }, 2600);
+  }
+
   function pageText(delta) {
     const next = textPage + delta;
     if (next < 0 || next >= textPages) return false;   // clamp, no wraparound
@@ -1127,9 +1221,8 @@
     // never split a line the way a character-count chunker would.
     textBodyEl.style.transform =
       "translateY(" + (-textPage * paneEl.clientHeight) + "px)";
-    textPageEl.textContent = textPages > 1
-      ? (textPage + 1) + " / " + textPages
-      : "";
+    textPageEl.textContent = textLabel +
+      (textPages > 1 ? "  " + (textPage + 1) + " / " + textPages : "");
     updateHud();
   }
 
