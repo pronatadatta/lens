@@ -387,7 +387,12 @@
   // ladder (600 x 4 = 2400), and is fetched ONLY if the wearer actually
   // zooms, so browsing never pays for detail nobody looked at.
   const BROWSE_WIDTH = 800;
-  const ZOOM_WIDTH = 2048;
+  // 2048 was chosen for 600 x 4 = 2400 of zoom headroom, but most sources
+  // in this gallery are only ~1100px wide, so the transform was upscaling:
+  // no new detail, and a 2048x2560 bitmap costs ~21MB of decoded memory on
+  // a device that has very little. 1600 halves that and still resolves more
+  // than the browse tier, which is the only thing the zoom step has to do.
+  const ZOOM_WIDTH = 1600;
   const TRANSFORM_QUALITY = 72;
 
   // The menu opens on a single UP swipe. It was a double pinch, which
@@ -744,6 +749,7 @@
 
   let hiResFor = -1;          // page index whose hi-res copy is loaded/loading
   let hiResLoader = null;     // in-flight loader; identity guards a stale swap
+  let imageRetries = 0;       // per-page, reset on every page change
 
   function dropHiRes() {
     if (hiResLoader) { hiResLoader.src = ""; hiResLoader = null; }
@@ -788,6 +794,7 @@
     // leak through.
     renderedW = 0;
     renderedH = 0;
+    imageRetries = 0;            // the budget is per photo, not per session
     dropHiRes();                 // new page starts back on the browse tier
 
     photoEl.alt = photo.display_name || "";
@@ -800,6 +807,15 @@
   }
 
   photoEl.addEventListener("load", function () {
+    // A decode that ran out of memory still fires `load` — just with zero
+    // natural dimensions. Without this check the element renders as a
+    // silent black rectangle, the error handler never runs, and there is
+    // nothing on screen to say anything went wrong.
+    if (!photoEl.naturalWidth || !photoEl.naturalHeight) {
+      imageFailed("decoded empty");
+      return;
+    }
+    imageRetries = 0;
     measureRendered();
     clampPan();
     applyTransform();
@@ -807,16 +823,35 @@
   });
 
   photoEl.addEventListener("error", function () {
-    // A single unreachable object must not break the state machine:
-    // stay in READY so the wearer can navigate off the bad page.
+    imageFailed("load error");
+  });
+
+  // Objects are served no-cache, so every view is a fresh download over
+  // the glasses' link. A truncated body decodes to nothing rather than
+  // raising, so one silent retry is worth more than an immediate failure.
+  function imageFailed(reason) {
     renderedW = 0;
     renderedH = 0;
-    if (appState === APP.READY) {
-      showOverlay("Image unavailable\n" + (pageIndex + 1) + " / " + photos.length, false);
-      photoEl.style.display = "none";
-      bumpHud();               // show the way out of a broken page
+    if (appState !== APP.READY) return;
+
+    const photo = photos[pageIndex];
+    if (photo && imageRetries < 1) {
+      imageRetries += 1;
+      debugNote("image " + reason + " — retrying");
+      // Cache-buster: without it a wedged intermediary can hand back the
+      // same broken body forever.
+      photoEl.src = urlFor(photo, BROWSE_WIDTH) + "&r=" + Date.now();
+      return;
     }
-  });
+
+    // A single unreachable object must not break the state machine:
+    // stay in READY so the wearer can navigate off the bad page. Naming
+    // the reason turns a black screen into something diagnosable.
+    showOverlay("Image unavailable (" + reason + ")\n" +
+                (pageIndex + 1) + " / " + photos.length, false);
+    photoEl.style.display = "none";
+    bumpHud();               // show the way out of a broken page
+  }
 
   /* ============================================================
      TRANSITIONS
