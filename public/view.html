@@ -210,6 +210,56 @@
      would draw the eye straight to the one row that cannot be undone. */
   #menu .row.danger.sel { color: #ff6b6b; }
 
+  /* ==========================================================
+     TEXT READER
+     ----------------------------------------------------------
+     Shows the OCR text Lawrence stored alongside the photo. Same
+     near-opaque black as the menu: on the waveguide an unlit pixel
+     is transparent, so painting black both hides the photo behind
+     and costs nothing to light.
+
+     Paging works by translating #textbody inside a fixed-height
+     #textpane rather than by chunking the string. The window IS the
+     page, so a page break can never land mid-line and the layout
+     stays correct at any font size or text length.
+     ========================================================== */
+  #textreader {
+    position: absolute;
+    inset: 0;
+    display: none;
+    background: rgba(0, 0, 0, 0.93);
+    padding: 26px 30px 46px;
+    box-sizing: border-box;
+  }
+  #textreader.open { display: block; }
+
+  #textpane {
+    position: relative;
+    height: 100%;
+    overflow: hidden;          /* the clipping window paging is defined against */
+  }
+
+  #textbody {
+    font: 400 19px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #f2f2f4;
+    white-space: pre-wrap;     /* OCR keeps its line breaks */
+    word-break: break-word;    /* a long URL must not push the column sideways */
+    will-change: transform;
+  }
+
+  /* Sits below the pane, outside the clip, so it never scrolls away. */
+  #textmeta {
+    position: absolute;
+    left: 30px;
+    right: 30px;
+    bottom: 16px;
+    display: flex;
+    justify-content: space-between;
+    font: 500 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.1em;
+    color: #7c7c86;
+  }
+
   /* Only with ?debug=1 — prints raw key names so the wearer can find
      out what a given gesture actually emits on real hardware. */
   #debug {
@@ -258,6 +308,12 @@
          fade, and must show even after the arrows have gone. -->
     <div id="zoomflash"></div>
     <div id="menu" aria-hidden="true"></div>
+
+    <div id="textreader" aria-hidden="true">
+      <div id="textpane"><div id="textbody"></div></div>
+      <div id="textmeta"><span id="textpage"></span><span>PINCH TO CLOSE</span></div>
+    </div>
+
     <div id="debug"></div>
   </div>
 
@@ -373,6 +429,12 @@
   let menuIndex = 0;
   let menuRows  = [];
 
+  // Text reader. `textPages` is derived from measured height on open, so it
+  // is only meaningful while the reader is up.
+  let textOpen  = false;
+  let textPage  = 0;
+  let textPages = 1;
+
   // READY-only viewport state.
   let pageIndex  = 0;
   let zoomScale  = 1;
@@ -411,6 +473,10 @@
 
   const flashEl = document.getElementById("zoomflash");
   const menuEl  = document.getElementById("menu");
+  const readerEl   = document.getElementById("textreader");
+  const paneEl     = document.getElementById("textpane");
+  const textBodyEl = document.getElementById("textbody");
+  const textPageEl = document.getElementById("textpage");
   const debugEl = document.getElementById("debug");
 
   let hudTimer   = null;
@@ -480,7 +546,9 @@
                  ((error && error.code) || "") + " " +
                  ((error && error.details) || "");
     const s = blob.toLowerCase();
-    return s.indexOf("deleted_at") !== -1 || s.indexOf("42703") !== -1;
+    return s.indexOf("deleted_at") !== -1 ||
+           s.indexOf("ocr_text") !== -1 ||
+           s.indexOf("42703") !== -1;     // undefined_column
   }
 
   async function fetchCollection() {
@@ -490,8 +558,11 @@
     // .order() because both are identifier positions. deleted_at is an
     // ordinary identifier and needs no quoting.
     if (binSupported) {
+      // ocr_text rides along with the bin columns: both arrived in the same
+      // migration, so if one is missing the fallback below covers both and
+      // the reader simply never offers itself.
       let q = c.from("photos")
-               .select('id, storage_path, "order", display_name, deleted_at');
+               .select('id, storage_path, "order", display_name, deleted_at, ocr_text');
       q = (collection === "bin") ? q.not("deleted_at", "is", null)
                                  : q.is("deleted_at", null);
       const { data, error } = await q.order('"order"', { ascending: true });
@@ -537,6 +608,9 @@
     appState = APP.LOADING;
     errorText = "";
     closeMenuSilently();
+    // Switching collections replaces `photos` wholesale, so text still on
+    // screen would belong to a row that is no longer at this index.
+    closeTextReaderSilently();
     render();
 
     try {
@@ -835,6 +909,12 @@
   function buildMenuRows() {
     const rows = [];
     if (collection === "live") {
+      // Offered only when this photo actually carries text, so the row is
+      // never a dead end. Photos uploaded before Lawrence existed, and any
+      // Vision found nothing in, simply do not show it.
+      if (currentText()) {
+        rows.push({ label: "Read text", run: openTextReader });
+      }
       // Both entries depend on the migration; without it the menu is
       // just Cancel, which is honest rather than offering a dead action.
       if (binSupported) {
@@ -971,6 +1051,83 @@
   function backToLive() { collection = "live"; loadGallery(); return true; }
 
   /* ============================================================
+     TEXT READER
+     ============================================================
+     Displays the OCR text Lawrence extracted at upload. Nothing is
+     recognised here — the web side never runs OCR; it only renders what
+     is already on the row. */
+
+  /// Trimmed text for a photo, or "" when there is none to show. Rows that
+  /// predate the OCR columns simply have no field, which reads as empty.
+  function textOf(photo) {
+    return (photo && typeof photo.ocr_text === "string")
+      ? photo.ocr_text.trim()
+      : "";
+  }
+
+  function currentText() {
+    return textOf(photos[pageIndex]);
+  }
+
+  function openTextReader() {
+    const body = currentText();
+    if (!body) return false;               // menu hides the row, but be safe
+
+    closeMenuSilently();
+    textBodyEl.textContent = body;
+    textOpen = true;
+    textPage = 0;
+    readerEl.classList.add("open");
+
+    // Measured AFTER the reader is visible: a display:none element reports
+    // zero height, which would collapse every text to a single page.
+    const windowHeight = paneEl.clientHeight || 1;
+    textPages = Math.max(1, Math.ceil(textBodyEl.scrollHeight / windowHeight));
+
+    hudEl.classList.remove("show");
+    if (hudTimer) { clearTimeout(hudTimer); hudTimer = null; }
+    renderTextReader();
+    return true;
+  }
+
+  /// Tears the reader down without re-rendering. For callers that are about
+  /// to redraw everything anyway, or are leaving READY entirely.
+  function closeTextReaderSilently() {
+    textOpen = false;
+    textPage = 0;
+    readerEl.classList.remove("open");
+    textBodyEl.style.transform = "";
+    textBodyEl.textContent = "";           // release the string with the view
+  }
+
+  function closeTextReader() {
+    closeTextReaderSilently();
+    render();
+    bumpHud();
+    return true;
+  }
+
+  function pageText(delta) {
+    const next = textPage + delta;
+    if (next < 0 || next >= textPages) return false;   // clamp, no wraparound
+    textPage = next;
+    renderTextReader();
+    return true;
+  }
+
+  function renderTextReader() {
+    if (!textOpen) return;
+    // Translating the block inside the clipping window means a page break can
+    // never split a line the way a character-count chunker would.
+    textBodyEl.style.transform =
+      "translateY(" + (-textPage * paneEl.clientHeight) + "px)";
+    textPageEl.textContent = textPages > 1
+      ? (textPage + 1) + " / " + textPages
+      : "";
+    updateHud();
+  }
+
+  /* ============================================================
      INPUT
      ============================================================ */
 
@@ -1026,6 +1183,18 @@
     }
 
     if (appState !== APP.READY) return false;
+
+    // The reader owns input while it is up: up/down turn its pages and a
+    // pinch closes it. Left/right are deliberately inert — paging the photo
+    // out from under the text being read would be disorienting.
+    if (textOpen) {
+      let ok = false;
+      if (action === "UP")          ok = pageText(-1);
+      else if (action === "DOWN")   ok = pageText(+1);
+      else if (action === "SELECT") ok = closeTextReader();
+      if (ok) lastActionAt = now;
+      return ok;
+    }
 
     // The menu owns input while it is open: arrows move the highlight
     // and never page or pan underneath it.
@@ -1236,9 +1405,10 @@
   }
 
   function updateHud() {
-    // The menu owns the screen while open — arrows there move the
-    // highlight, so paging affordances would be actively misleading.
-    if (menuOpen) {
+    // The menu and reader own the screen while up — their arrows mean
+    // something else entirely, so the paging affordances would be actively
+    // misleading. The reader draws its own page counter instead.
+    if (menuOpen || textOpen) {
       hudEl.classList.remove("show");
       return;
     }
