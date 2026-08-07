@@ -315,6 +315,15 @@
   // Days a photo sits in the bin before it is purged for good.
   const BIN_RETENTION_DAYS = 7;
 
+  // Two-tier image loading. The stage is 600px, so 800 already oversamples
+  // what the lens can resolve at 1x — it is fetched for every page and keeps
+  // paging near-instant. The 2048 tier only exists to survive the 4x zoom
+  // ladder (600 x 4 = 2400), and is fetched ONLY if the wearer actually
+  // zooms, so browsing never pays for detail nobody looked at.
+  const BROWSE_WIDTH = 800;
+  const ZOOM_WIDTH = 2048;
+  const TRANSFORM_QUALITY = 72;
+
   // The band emits keydown only — never keyup — so a press has no
   // measurable duration and a long press is undetectable. The menu is
   // opened by a double pinch instead. The lower bound sits above
@@ -444,8 +453,22 @@
     return client;
   }
 
-  function urlFor(photo) {
-    return getClient().storage.from(BUCKET).getPublicUrl(photo.storage_path).data.publicUrl;
+  // Served through Supabase's image transform endpoint rather than the raw
+  // object. The stored master is several MB; the stage is 600px, so fetching
+  // the original meant downloading 20-50x more image than a lens pixel can
+  // ever show. The transform also negotiates WebP off the browser's Accept
+  // header, which is most of the saving.
+  //
+  // Transforms are derived from the stored original, so this costs no
+  // re-upload and applies to photos that are already in the gallery.
+  function urlFor(photo, width) {
+    return getClient().storage.from(BUCKET).getPublicUrl(photo.storage_path, {
+      transform: {
+        width: width || BROWSE_WIDTH,
+        quality: TRANSFORM_QUALITY,
+        resize: "contain"       // never crop; letterboxing is the img's job
+      }
+    }).data.publicUrl;
   }
 
   // A pre-migration database has no deleted_at column. Rather than
@@ -632,6 +655,49 @@
     });
   }
 
+  /* ---------- zoom tier ----------
+     The high-resolution copy is fetched lazily, off-screen, and only swapped
+     in once it has fully decoded — assigning it to the live <img> directly
+     would blank the photo mid-zoom while it downloaded. */
+
+  let hiResFor = -1;          // page index whose hi-res copy is loaded/loading
+  let hiResLoader = null;     // in-flight loader; identity guards a stale swap
+
+  function dropHiRes() {
+    if (hiResLoader) { hiResLoader.src = ""; hiResLoader = null; }
+    hiResFor = -1;
+  }
+
+  function requestHiRes() {
+    if (appState !== APP.READY) return;
+    if (hiResFor === pageIndex) return;      // already have it, or fetching it
+    const photo = photos[pageIndex];
+    if (!photo) return;
+
+    hiResFor = pageIndex;
+    const wanted = pageIndex;
+    const url = urlFor(photo, ZOOM_WIDTH);
+
+    const loader = new Image();
+    loader.decoding = "async";
+    hiResLoader = loader;
+    loader.onload = function () {
+      // Paging away mid-flight must not slam a stale photo onto the screen.
+      if (loader !== hiResLoader || wanted !== pageIndex) return;
+      hiResLoader = null;
+      // Same displayed geometry, more pixels: the load handler re-measures,
+      // and pan stays clamped because the rendered box is unchanged.
+      photoEl.src = url;
+    };
+    loader.onerror = function () {
+      // Losing the upgrade is not worth breaking the page over — the browse
+      // tier is already on screen and perfectly usable.
+      if (loader === hiResLoader) hiResLoader = null;
+      if (wanted === hiResFor) hiResFor = -1;   // let a later zoom retry
+    };
+    loader.src = url;
+  }
+
   function showCurrentPage() {
     const photo = photos[pageIndex];
 
@@ -640,9 +706,10 @@
     // leak through.
     renderedW = 0;
     renderedH = 0;
+    dropHiRes();                 // new page starts back on the browse tier
 
     photoEl.alt = photo.display_name || "";
-    photoEl.src = urlFor(photo);
+    photoEl.src = urlFor(photo, BROWSE_WIDTH);
 
     applyTransform();
     applyContrast();
@@ -691,6 +758,10 @@
     clampPan();
     applyTransform();
     flashZoom(nextScale > prev ? +1 : -1, false);
+    // The moment magnification is asked for, the browse tier stops being
+    // enough. Fetched here rather than on every page so a wearer who never
+    // zooms never downloads it.
+    if (zoomScale > 1) requestHiRes();
     render();
     return true;
   }
