@@ -396,7 +396,7 @@
   // report of "it still does X" can be tied to a specific build rather
   // than guessed at — a stale page and a real bug read identically from
   // a description otherwise.
-  const BUILD = "b11";
+  const BUILD = "b12";
 
   // Days a photo sits in the bin before it is purged for good.
   const BIN_RETENTION_DAYS = 7;
@@ -778,6 +778,29 @@
     hiResFor = -1;
   }
 
+  /// Confirms the browse-tier frame actually decoded, and escalates to the
+  /// larger tier if it did not.
+  ///
+  /// One photo renders solid black on the glasses at 800px while the very
+  /// same photo at 1600px is perfect, and its bytes are structurally
+  /// identical to neighbours that work — same VP8X WebP, same 800x1000
+  /// output, byte-identical EXIF. So it cannot be predicted from the file,
+  /// and the device's decoder is simply failing on that particular encode.
+  ///
+  /// decode() is the API built for exactly this: it settles only once the
+  /// frame is genuinely ready to paint, and rejects when the decoder gives
+  /// up — a failure that `load` reports as success. It is also why the zoom
+  /// tier already works: that path decodes off-screen before it is shown.
+  function verifyDecode(photo, index) {
+    if (!photoEl.decode) return;              // older engines: nothing to do
+    photoEl.decode().catch(function () {
+      // Paging away mid-decode makes this answer irrelevant.
+      if (index !== pageIndex || appState !== APP.READY) return;
+      debugNote("browse-tier decode failed — escalating");
+      requestHiRes();
+    });
+  }
+
   function requestHiRes() {
     if (appState !== APP.READY) return;
     if (hiResFor === pageIndex) return;      // already have it, or fetching it
@@ -821,6 +844,7 @@
 
     photoEl.alt = photo.display_name || "";
     photoEl.src = urlFor(photo, BROWSE_WIDTH);
+    verifyDecode(photo, pageIndex);
 
     applyTransform();
     applyContrast();
